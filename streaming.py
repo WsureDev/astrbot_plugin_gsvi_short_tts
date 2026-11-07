@@ -25,7 +25,6 @@ async def convert_stream(
     ],
     scope: ContextVar[Scope | None],
     paths: list[Path],
-    deliver_voice: Callable[[MessageChain], Awaitable[None]] | None,
 ) -> AsyncGenerator[MessageChain, None]:
     frames: list[MessageChain] = []
 
@@ -41,12 +40,7 @@ async def convert_stream(
             converted, path = await convert(channel, message)
             if path is not None:
                 paths.append(path)
-                if deliver_voice is None:
-                    yield converted
-                else:
-                    # Text-stream renderers may discard Record components.
-                    # Deliver voice through their ordinary media send method.
-                    await deliver_voice(converted)
+                yield converted
                 return
         for frame in pending:
             yield frame

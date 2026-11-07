@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import suppress
 from pathlib import Path
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import Plain, Record
 from astrbot.api.provider import ProviderRequest
@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from .channels import Channel, resolve_channel
 from .commands import parse_command
 from .gsvi import GsviClient, GsviError
-from .origins import mark_request_origin
+from .origins import CURRENT_TOOL, mark_request_origin
 from .outgoing import SKIP_TTS_KEY, OutgoingTts
 from .reply_gate import REQUEST_KEY, FinalReplyGate
 from .settings import ChannelSettingsSchema, GsviSettingsSchema, VoiceChoicesCacheSchema
@@ -61,7 +61,7 @@ class GsviShortTtsPlugin(Star):
                 if entry.source == source:
                     self.voice_choices = entry.voices
             except ValidationError:
-                self.logger.warning("音色列表缓存格式不正确，将重新拉取。")
+                logger.warning("音色列表缓存格式不正确，将重新拉取。")
         self.show_voice_choices("正在刷新音色列表，稍后重新打开配置查看。")
         if self.config.get("refresh_voices", False):
             # Reset only here, before starting the background request. An old
@@ -114,7 +114,7 @@ class GsviShortTtsPlugin(Star):
             self.show_voice_choices(
                 f"已加载 {len(voices)} 个音色。重新打开配置可查看最新列表。"
             )
-            self.logger.info("已刷新 GSVI 音色列表，共 %s 个。", len(voices))
+            logger.info(f"已刷新 GSVI 音色列表，共 {len(voices)} 个。")
         except Exception as error:
             reason = "音色列表刷新超时。"
             if isinstance(error, GsviError):
@@ -124,7 +124,7 @@ class GsviShortTtsPlugin(Star):
             self.show_voice_choices(
                 f"{reason}保留已有列表及当前选择；没有缓存时可手动填写。"
             )
-            self.logger.warning("%s", reason)
+            logger.warning(reason)
 
     async def load_channel(
         self, channel: Channel
@@ -200,11 +200,24 @@ class GsviShortTtsPlugin(Star):
         self.outgoing.bind_event(event)
         event.set_extra(POLICY_KEY, None)
         if event.get_extra("action_type") == "live":
+            logger.debug(
+                f"[GSVI TTS] entry=prepare target={event.unified_msg_origin} "
+                "reason=live_mode"
+            )
             return
         try:
-            policy, _ = await self.load_channel(resolve_channel(event))
+            policy, initialized = await self.load_channel(resolve_channel(event))
         except (ValueError, ValidationError):
+            logger.debug(
+                f"[GSVI TTS] entry=prepare target={event.unified_msg_origin} "
+                "reason=invalid_channel_or_policy"
+            )
             return
+        logger.debug(
+            f"[GSVI TTS] entry=prepare target={event.unified_msg_origin} "
+            f"initialized={initialized} enabled={policy.enabled} "
+            f"max_chars={policy.max_chars} probability={policy.probability}"
+        )
         if not policy.enabled or policy.probability == 0:
             return
         event.set_extra(POLICY_KEY, policy)
@@ -212,6 +225,10 @@ class GsviShortTtsPlugin(Star):
     @filter.on_llm_request()
     async def mark_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         mark_request_origin(event)
+        logger.debug(
+            f"[GSVI TTS] entry=request target={event.unified_msg_origin} "
+            f"request={id(req)} task={id(asyncio.current_task())} reason=request_marked"
+        )
         if event.get_extra(POLICY_KEY) is not None:
             event.set_extra(REQUEST_KEY, req)
 
@@ -225,12 +242,22 @@ class GsviShortTtsPlugin(Star):
             "reasoning",
             "break",
         }:
+            logger.debug(f"[GSVI TTS] target={channel.key} reason=control_frame")
             return chain, None
         try:
-            policy, _ = await self.load_channel(channel)
+            policy, initialized = await self.load_channel(channel)
         except (ValueError, ValidationError):
+            logger.warning(f"[GSVI TTS] target={channel.key} reason=invalid_policy")
             return chain, None
+        logger.debug(
+            f"[GSVI TTS] target={channel.key} initialized={initialized} "
+            f"enabled={policy.enabled} max_chars={policy.max_chars} "
+            f"probability={policy.probability}"
+        )
         if not policy.enabled or policy.probability == 0:
+            logger.debug(
+                f"[GSVI TTS] target={channel.key} reason=disabled_or_zero_probability"
+            )
             return chain, None
         return await self.convert_chain(chain, policy)
 
@@ -238,23 +265,57 @@ class GsviShortTtsPlugin(Star):
         try:
             policy, _ = await self.load_channel(channel)
         except (ValueError, ValidationError):
+            logger.warning(f"[GSVI TTS] target={channel.key} reason=invalid_policy")
             return False
-        return policy.enabled and policy.probability > 0
+        enabled = policy.enabled and policy.probability > 0
+        if not enabled:
+            logger.debug(
+                f"[GSVI TTS] target={channel.key} reason=disabled_or_zero_probability"
+            )
+        return enabled
 
     async def convert_chain(
         self, chain: MessageChain, policy: ChannelSettingsSchema
     ) -> tuple[MessageChain, Path | None]:
         if not all(isinstance(component, Plain) for component in chain.chain):
+            logger.debug("[GSVI TTS] reason=mixed_content")
             return chain, None
         text = "".join(component.text for component in chain.chain).strip()
         if not text or len(text) > policy.max_chars:
+            logger.debug(
+                f"[GSVI TTS] reason=empty_or_over_limit chars={len(text)} "
+                f"max_chars={policy.max_chars}"
+            )
             return chain, None
         if secrets.randbelow(100) >= policy.probability:
+            logger.debug("[GSVI TTS] reason=probability_miss")
+            return chain, None
+        timeout = self.settings.timeout_ms / 1000
+        tool = CURRENT_TOOL.get()
+        if tool is not None:
+            timeout = min(timeout, 10)
+            if tool.active:
+                timeout = min(
+                    timeout, tool.deadline - asyncio.get_running_loop().time()
+                )
+        if timeout <= 0:
+            logger.debug("[GSVI TTS] reason=tool_budget_exhausted fallback=text")
             return chain, None
         try:
-            path = await self.client.synthesize(text, policy.voice, self.directory)
+            # One budget covers synthesis, download and writing the WAV.
+            async with asyncio.timeout(timeout):
+                path = await self.client.synthesize(text, policy.voice, self.directory)
+            logger.debug(f"[GSVI TTS] reason=converted chars={len(text)}")
             record = Record(file=str(path), url=str(path), text=text)
             return chain.derive(chain=[record]), path
-        except (GsviError, OSError) as error:
-            self.logger.warning("GSVI TTS 失败，保留原文字：%s", error)
+        except (GsviError, OSError, TimeoutError) as error:
+            detail = "音频文件写入失败。"
+            if isinstance(error, GsviError):
+                detail = str(error)
+            elif isinstance(error, TimeoutError):
+                detail = "合成、下载或文件写入的总预算耗尽。"
+            logger.warning(
+                f"[GSVI TTS] reason=synthesis_failed error={type(error).__name__} "
+                f"fallback=text detail={detail}"
+            )
             return chain, None

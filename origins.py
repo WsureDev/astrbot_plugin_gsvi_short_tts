@@ -13,9 +13,33 @@ from weakref import WeakKeyDictionary
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
+PLUGIN_NAME = "astrbot_plugin_gsvi_short_tts"
 Origin = Literal["llm", "cron", "background_task"]
 CURRENT_ORIGIN: ContextVar[Origin | None] = ContextVar("gsvi_llm_origin", default=None)
 REQUEST_ORIGIN_KEY = "astrbot_plugin_gsvi_short_tts.request_origin"
+
+
+@dataclass
+class ToolDelivery:
+    event: AstrMessageEvent
+    deadline: float
+    active: bool = True
+
+
+CURRENT_TOOL: ContextVar[ToolDelivery | None] = ContextVar(
+    "gsvi_tool_delivery", default=None
+)
+
+
+def event_skip_reason(event: AstrMessageEvent) -> str | None:
+    plugins = event.plugins_name
+    if plugins is not None and plugins != ["*"] and PLUGIN_NAME not in plugins:
+        return "plugin_excluded"
+    if event.get_extra("astrbot_plugin_gsvi_short_tts.skip_delivery"):
+        return "skip_delivery"
+    if event.get_extra("action_type") == "live":
+        return "live_mode"
+    return None
 
 
 @dataclass(frozen=True)
