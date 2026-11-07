@@ -54,11 +54,15 @@ class SendScope:
     destination: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class Presentation:
     event: AstrMessageEvent
     result: MessageChain
     pure_text: bool
+    task: asyncio.Task[object] | None
+    message: MessageChain
+    evaluated: bool = False
+    converted: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,7 +143,11 @@ class OutgoingTts:
             # RespondStage mutates result.chain when extracting Record/headers.
             # Capture eligibility at its entry, after final decorators ran.
             snapshot = Presentation(
-                event, result, all(isinstance(c, Plain) for c in result.chain)
+                event,
+                result,
+                all(isinstance(c, Plain) for c in result.chain),
+                asyncio.current_task(),
+                result.derive(chain=list(result.chain)),
             )
             token = self.presentation.set(snapshot)
             try:
@@ -148,6 +156,25 @@ class OutgoingTts:
                 self.presentation.reset(token)
 
         self.remember(RespondStage, "process", original, process)
+
+    def own_presentation(
+        self, event: AstrMessageEvent, message: MessageChain
+    ) -> Presentation | None:
+        snapshot = self.presentation.get()
+        if (
+            snapshot is not None
+            and snapshot.task is asyncio.current_task()
+            and snapshot.event is event
+            and snapshot.result is event.get_result()
+            and snapshot.pure_text
+            and message.chain
+            and all(
+                any(component is original for original in snapshot.message.chain)
+                for component in message.chain
+            )
+        ):
+            return snapshot
+        return None
 
     def target_allowed(self, destination: str) -> bool:
         plugins = self.context.get_config(destination).get("plugin_set", ["*"])
@@ -296,6 +323,19 @@ class OutgoingTts:
         async def send(event, message):
             if not self.active(cls, "send", send):
                 return await original(event, message)
+            presentation = None
+            if message is not None:
+                presentation = self.own_presentation(event, message)
+            if presentation is not None and presentation.evaluated:
+                if presentation.converted:
+                    self.trace(
+                        "event", event.unified_msg_origin, "presentation_delivered"
+                    )
+                    return None
+                # The whole reply missed TTS: preserve native text segmentation
+                # without retrying probability or synthesis for each fragment.
+                with origin_scope(None):
+                    return await original(event, message)
             reason = self.skip_reason(event)
             if (
                 reason is None
@@ -331,7 +371,15 @@ class OutgoingTts:
             try:
                 with origin_scope(source):
                     self.trace("event", channel.key, "evaluate")
-                    converted, path = await self.convert(channel, message)
+                    candidate = message
+                    if presentation is not None:
+                        candidate = presentation.message
+                        presentation.evaluated = True
+                    converted, path = await self.convert(channel, candidate)
+                    if presentation is not None:
+                        presentation.converted = path is not None
+                        if path is None:
+                            converted = message
                     return await original(event, converted)
             finally:
                 self.scope.reset(token)
@@ -361,10 +409,7 @@ class OutgoingTts:
             channel = None
             if self.active(cls, "send_streaming", send):
                 channel = self.event_channel(event)
-            if (
-                channel is None
-                or not await self.enabled(channel)
-            ):
+            if channel is None or not await self.enabled(channel):
                 self.trace(
                     "stream", event.unified_msg_origin, "unresolved_nested_or_disabled"
                 )
