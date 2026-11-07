@@ -45,7 +45,7 @@ class GsviShortTtsPlugin(Star):
             ) from None
         self.client = GsviClient(self.settings)
         self.directory = Path(get_astrbot_temp_path()) / "gsvi_short_tts"
-        self.gate = FinalReplyGate()
+        self.gate = FinalReplyGate(self.convert_event_reply)
         self.outgoing = OutgoingTts(context, self.convert_outgoing)
         self.voice_refresh_task: asyncio.Task[None] | None = None
         self.voice_choices: list[str] = []
@@ -218,17 +218,7 @@ class GsviShortTtsPlugin(Star):
     async def convert_final_reply(
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> None:
-        # Wakeups deliver via Context.send_message, where the real destination
-        # and current policy are available. Decide probability only there.
-        if getattr(event, "event_kind", "message") == "agent_wakeup":
-            return
-        policy = cast(ChannelSettingsSchema | None, event.get_extra(POLICY_KEY))
-        if policy is None or resp.role != "assistant" or resp.tools_call_name:
-            return
-        if event.is_stopped() or event.get_extra("agent_stop_requested"):
-            return
-        stop_signal = event.get_extra("_background_stop_signal")
-        if isinstance(stop_signal, asyncio.Event) and stop_signal.is_set():
+        if resp.role != "assistant" or resp.tools_call_name:
             return
         if event.get_extra(PROCESSED_KEY) is resp:
             return
@@ -236,10 +226,29 @@ class GsviShortTtsPlugin(Star):
         chain = resp.result_chain
         if chain is None:
             chain = MessageChain().message(resp.completion_text or "")
+        converted = await self.convert_event_reply(event, chain)
+        if converted is not chain:
+            resp.result_chain = converted
+
+    async def convert_event_reply(
+        self, event: AstrMessageEvent, chain: MessageChain
+    ) -> MessageChain:
+        # Wakeups deliver via Context.send_message, where the real destination
+        # and current policy are available. Decide probability only there.
+        if getattr(event, "event_kind", "message") == "agent_wakeup":
+            return chain
+        policy = cast(ChannelSettingsSchema | None, event.get_extra(POLICY_KEY))
+        if policy is None:
+            return chain
+        if event.is_stopped() or event.get_extra("agent_stop_requested"):
+            return chain
+        stop_signal = event.get_extra("_background_stop_signal")
+        if isinstance(stop_signal, asyncio.Event) and stop_signal.is_set():
+            return chain
         converted, path = await self.convert_chain(chain, policy)
         if path is not None:
             event.track_temporary_local_file(str(path))
-            resp.result_chain = converted
+        return converted
 
     async def convert_outgoing(
         self, session: MessageSession, chain: MessageChain
@@ -265,11 +274,9 @@ class GsviShortTtsPlugin(Star):
     async def convert_chain(
         self, chain: MessageChain, policy: ChannelSettingsSchema
     ) -> tuple[MessageChain, Path | None]:
-        if any(isinstance(component, Record) for component in chain.chain):
+        if not all(isinstance(component, Plain) for component in chain.chain):
             return chain, None
-        text = "".join(
-            component.text for component in chain.chain if isinstance(component, Plain)
-        ).strip()
+        text = "".join(component.text for component in chain.chain).strip()
         if not text or len(text) > policy.max_chars:
             return chain, None
         if secrets.randbelow(100) >= policy.probability:
@@ -277,16 +284,7 @@ class GsviShortTtsPlugin(Star):
         try:
             path = await self.client.synthesize(text, policy.voice, self.directory)
             record = Record(file=str(path), url=str(path), text=text)
-            components = []
-            inserted = False
-            for component in chain.chain:
-                if isinstance(component, Plain):
-                    if not inserted:
-                        components.append(record)
-                        inserted = True
-                else:
-                    components.append(component)
-            return chain.derive(chain=components), path
+            return chain.derive(chain=[record]), path
         except (GsviError, OSError) as error:
             self.logger.warning("GSVI TTS 失败，保留原文字：%s", error)
             return chain, None
