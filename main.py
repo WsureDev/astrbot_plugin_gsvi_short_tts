@@ -7,27 +7,25 @@ import secrets
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from pathlib import Path
-from typing import cast
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.message_components import Plain, Record
-from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from pydantic import ValidationError
 
-from .channels import Channel, resolve_channel, resolve_destination
+from .channels import Channel, resolve_channel
 from .commands import parse_command
 from .gsvi import GsviClient, GsviError
-from .outgoing import OutgoingTts
+from .origins import mark_request_origin
+from .outgoing import SKIP_TTS_KEY, OutgoingTts
 from .reply_gate import REQUEST_KEY, FinalReplyGate
 from .settings import ChannelSettingsSchema, GsviSettingsSchema, VoiceChoicesCacheSchema
 
 POLICY_KEY = "astrbot_plugin_gsvi_short_tts.policy"
-PROCESSED_KEY = "astrbot_plugin_gsvi_short_tts.processed_response"
 
 
 class GsviShortTtsPlugin(Star):
@@ -45,8 +43,10 @@ class GsviShortTtsPlugin(Star):
             ) from None
         self.client = GsviClient(self.settings)
         self.directory = Path(get_astrbot_temp_path()) / "gsvi_short_tts"
-        self.gate = FinalReplyGate(self.convert_event_reply)
-        self.outgoing = OutgoingTts(context, self.convert_outgoing)
+        self.gate = FinalReplyGate()
+        self.outgoing = OutgoingTts(
+            context, self.convert_outgoing, self.delivery_enabled
+        )
         self.voice_refresh_task: asyncio.Task[None] | None = None
         self.voice_choices: list[str] = []
 
@@ -141,6 +141,7 @@ class GsviShortTtsPlugin(Star):
         """Configure this group, private chat, or WebChat conversation."""
         # AstrBot's call_llm flag suppresses its automatic LLM path when true.
         event.should_call_llm(True)
+        event.set_extra(SKIP_TTS_KEY, True)
         try:
             command = parse_command(event.message_str)
             if command.action == "list":
@@ -196,6 +197,7 @@ class GsviShortTtsPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1000)
     async def prepare_reply(self, event: AstrMessageEvent) -> None:
+        self.outgoing.bind_event(event)
         event.set_extra(POLICY_KEY, None)
         if event.get_extra("action_type") == "live":
             return
@@ -206,55 +208,17 @@ class GsviShortTtsPlugin(Star):
         if not policy.enabled or policy.probability == 0:
             return
         event.set_extra(POLICY_KEY, policy)
-        event.set_extra("enable_streaming", False)
-        event.set_extra("enable_reasoning", False)
 
     @filter.on_llm_request()
     async def mark_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        mark_request_origin(event)
         if event.get_extra(POLICY_KEY) is not None:
             event.set_extra(REQUEST_KEY, req)
 
-    @filter.on_llm_response(priority=-1000)
-    async def convert_final_reply(
-        self, event: AstrMessageEvent, resp: LLMResponse
-    ) -> None:
-        if resp.role != "assistant" or resp.tools_call_name:
-            return
-        if event.get_extra(PROCESSED_KEY) is resp:
-            return
-        event.set_extra(PROCESSED_KEY, resp)
-        chain = resp.result_chain
-        if chain is None:
-            chain = MessageChain().message(resp.completion_text or "")
-        converted = await self.convert_event_reply(event, chain)
-        if converted is not chain:
-            resp.result_chain = converted
-
-    async def convert_event_reply(
-        self, event: AstrMessageEvent, chain: MessageChain
-    ) -> MessageChain:
-        # Wakeups deliver via Context.send_message, where the real destination
-        # and current policy are available. Decide probability only there.
-        if getattr(event, "event_kind", "message") == "agent_wakeup":
-            return chain
-        policy = cast(ChannelSettingsSchema | None, event.get_extra(POLICY_KEY))
-        if policy is None:
-            return chain
-        if event.is_stopped() or event.get_extra("agent_stop_requested"):
-            return chain
-        stop_signal = event.get_extra("_background_stop_signal")
-        if isinstance(stop_signal, asyncio.Event) and stop_signal.is_set():
-            return chain
-        converted, path = await self.convert_chain(chain, policy)
-        if path is not None:
-            event.track_temporary_local_file(str(path))
-        return converted
-
     async def convert_outgoing(
-        self, session: MessageSession, chain: MessageChain
+        self, channel: Channel, chain: MessageChain
     ) -> tuple[MessageChain, Path | None]:
-        platform = self.context.get_platform_inst(session.platform_id)
-        if platform is None or chain.type in {
+        if chain.type in {
             "tool_call",
             "tool_call_result",
             "agent_stats",
@@ -263,13 +227,19 @@ class GsviShortTtsPlugin(Star):
         }:
             return chain, None
         try:
-            channel = resolve_destination(session, platform.meta().name)
             policy, _ = await self.load_channel(channel)
         except (ValueError, ValidationError):
             return chain, None
         if not policy.enabled or policy.probability == 0:
             return chain, None
         return await self.convert_chain(chain, policy)
+
+    async def delivery_enabled(self, channel: Channel) -> bool:
+        try:
+            policy, _ = await self.load_channel(channel)
+        except (ValueError, ValidationError):
+            return False
+        return policy.enabled and policy.probability > 0
 
     async def convert_chain(
         self, chain: MessageChain, policy: ChannelSettingsSchema

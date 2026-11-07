@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from functools import wraps
 from typing import TypeAlias
 from weakref import WeakKeyDictionary
 
-from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.response import AgentResponse, AgentResponseData
 from astrbot.core.agent.runners.base import AgentState
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
@@ -16,17 +15,17 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import ProviderRequest
 
+from .origins import agent_origin, origin_scope
+
 REQUEST_KEY = "astrbot_plugin_gsvi_short_tts.request"
 Runner: TypeAlias = ToolLoopAgentRunner[AstrAgentContext]
 Step: TypeAlias = Callable[[Runner], AsyncGenerator[AgentResponse, None]]
-Finish: TypeAlias = Callable[[AstrMessageEvent, MessageChain], Awaitable[MessageChain]]
 
 
 class FinalReplyGate:
     """Avoid early delivery in skills_like re-query and merged-reply branches."""
 
-    def __init__(self, finish: Finish) -> None:
-        self.finish = finish
+    def __init__(self) -> None:
         self.original: Step | None = None
         self.installed: Step | None = None
         self.requests: WeakKeyDictionary[Runner, ProviderRequest] = WeakKeyDictionary()
@@ -48,7 +47,17 @@ class FinalReplyGate:
                 self.requests[runner] = runner.req
             terminal_chain = None
             async with aclosing(original(runner)) as responses:
-                async for response in responses:
+                while True:
+                    try:
+                        if self.installed is gated_step:
+                            # Background tasks spawned by real agent/tool execution
+                            # inherit provenance; unrelated plugin tasks do not.
+                            with origin_scope(agent_origin(event)):
+                                response = await anext(responses)
+                        else:
+                            response = await anext(responses)
+                    except StopAsyncIteration:
+                        break
                     if (
                         response.type == "tool_call_result"
                         and response.data["chain"].type == "tool_direct_result"
@@ -74,8 +83,7 @@ class FinalReplyGate:
             if final is None:
                 if runner._state != AgentState.DONE or terminal_chain is None:
                     return
-                # No native final-response hook runs on a tool-ended turn.
-                chain = await self.finish(event, terminal_chain)
+                chain = terminal_chain
             else:
                 if final.role != "assistant":
                     return
