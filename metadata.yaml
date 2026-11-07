@@ -1,7 +1,7 @@
 name: astrbot_plugin_gsvi_short_tts
 display_name: GSVI 渠道短文本语音
 desc: 直接调用 GSVI，仅将 LLM 相关的纯文本短回复转换为语音。群聊、私聊、WebChat 分别设置音色、字数和概率，支持 Header 与 API Key。
-version: 1.4.0
+version: 1.4.1
 author: wsure
 repo: https://github.com/WsureDev/astrbot_plugin_gsvi_short_tts
 astrbot_version: ">=4.28,<4.30"
