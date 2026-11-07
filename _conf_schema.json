@@ -1,0 +1,91 @@
+{
+  "api_base": {
+    "type": "string",
+    "description": "GSVI 服务地址",
+    "default": "http://127.0.0.1:8000",
+    "hint": "填写 AstrBot 可访问的地址，可包含反向代理路径前缀。所有请求均直接使用 GSVI 接口。"
+  },
+  "version": {
+    "type": "string",
+    "description": "GSVI 版本",
+    "options": ["v1", "v2", "v4"],
+    "default": "v4",
+    "hint": "配套 gpt-sovits-next 服务的 v4 为兼容入口，涵盖全部已注册音色。"
+  },
+  "api_key": {
+    "type": "string",
+    "description": "API Key",
+    "secret": true,
+    "default": "",
+    "hint": "非空时自动发送 Authorization: Bearer <key>。服务端或反向代理需要自行校验该 Key。"
+  },
+  "request_headers": {
+    "type": "string",
+    "description": "自定义请求 Header（JSON）",
+    "secret": true,
+    "default": "{}",
+    "hint": "填写 JSON 字符串对象，例如 {\"X-API-Key\":\"your-key\"}。Header 名称不区分大小写；显式 Authorization 优先于 API Key 自动值。音色查询、合成和同源下载沿用这些 Header。"
+  },
+  "download_headers": {
+    "type": "string",
+    "description": "音频下载专用 Header（JSON）",
+    "secret": true,
+    "default": "{}",
+    "hint": "可选。不同源的音频下载不自动带服务认证；可在此显式填写下载所需 Header。下载重定向到其他源时不会转发这些 Header。"
+  },
+  "timeout_ms": {
+    "type": "int",
+    "description": "单阶段请求超时（毫秒）",
+    "default": 180000,
+    "hint": "音色查询、合成、下载分别计时。失败时保留文字。"
+  },
+  "text_lang": {
+    "type": "string",
+    "description": "合成文本语言",
+    "default": "中文"
+  },
+  "emotion": {
+    "type": "string",
+    "description": "情绪／参考预设",
+    "default": "默认",
+    "hint": "需要是该角色在 /models/{version} 中列出的情绪。"
+  },
+  "prompt_text_lang": {
+    "type": "string",
+    "description": "参考音频语言",
+    "default": "",
+    "hint": "留空时不发送，由服务端按参考预设选择。需要显式指定时，填写中文、英语等 GSVI 语言名称。"
+  },
+  "refresh_voices": {
+    "type": "bool",
+    "description": "刷新音色列表（执行一次）",
+    "default": false,
+    "hint": "勾选并保存后后台刷新一次，开关自动复位。插件加载、保存配置后也会自动刷新。稍后重新打开配置查看最新下拉选项；刷新失败保留已有列表和当前选择。"
+  },
+  "preset": {
+    "type": "object",
+    "description": "渠道初始化预设",
+    "hint": "各渠道默认关闭。首次 on/off 使用此预设并保存为独立配置，之后不随全局预设变化。",
+    "items": {
+      "voice": {
+        "type": "string",
+        "description": "预设音色",
+        "default": "花火",
+        "hint": "加载后自动从 /models/{version} 获取下拉选项。没有可用列表时允许手动填写角色键。"
+      },
+      "max_chars": {
+        "type": "int",
+        "description": "预设字数界限",
+        "default": 100,
+        "hint": "正整数。最终文字去除首尾空白后按 Unicode 码点数计数，等于界限也可触发。"
+      },
+      "probability": {
+        "type": "int",
+        "description": "预设触发概率（%）",
+        "default": 100,
+        "slider": {"min": 0, "max": 100, "step": 1},
+        "hint": "0–100 的整数，0 永不触发，100 必定触发。"
+      }
+    }
+  }
+}
