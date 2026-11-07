@@ -15,12 +15,14 @@ from astrbot.api.message_components import Plain, Record
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 from pydantic import ValidationError
 
-from .channels import Channel, resolve_channel
+from .channels import Channel, resolve_channel, resolve_destination
 from .commands import parse_command
 from .gsvi import GsviClient, GsviError
+from .outgoing import OutgoingTts
 from .reply_gate import REQUEST_KEY, FinalReplyGate
 from .settings import ChannelSettingsSchema, GsviSettingsSchema, VoiceChoicesCacheSchema
 
@@ -44,11 +46,13 @@ class GsviShortTtsPlugin(Star):
         self.client = GsviClient(self.settings)
         self.directory = Path(get_astrbot_temp_path()) / "gsvi_short_tts"
         self.gate = FinalReplyGate()
+        self.outgoing = OutgoingTts(context, self.convert_outgoing)
         self.voice_refresh_task: asyncio.Task[None] | None = None
         self.voice_choices: list[str] = []
 
     async def initialize(self) -> None:
         self.gate.install()
+        self.outgoing.install()
         source = f"{self.client.base}/models/{self.settings.version}"
         cached = await self.get_kv_data("voice_choices", None)
         if cached is not None:
@@ -68,6 +72,7 @@ class GsviShortTtsPlugin(Star):
 
     async def terminate(self) -> None:
         self.gate.uninstall()
+        self.outgoing.uninstall()
         if self.voice_refresh_task is not None:
             self.voice_refresh_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -213,6 +218,10 @@ class GsviShortTtsPlugin(Star):
     async def convert_final_reply(
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> None:
+        # Wakeups deliver via Context.send_message, where the real destination
+        # and current policy are available. Decide probability only there.
+        if getattr(event, "event_kind", "message") == "agent_wakeup":
+            return
         policy = cast(ChannelSettingsSchema | None, event.get_extra(POLICY_KEY))
         if policy is None or resp.role != "assistant" or resp.tools_call_name:
             return
@@ -227,18 +236,46 @@ class GsviShortTtsPlugin(Star):
         chain = resp.result_chain
         if chain is None:
             chain = MessageChain().message(resp.completion_text or "")
+        converted, path = await self.convert_chain(chain, policy)
+        if path is not None:
+            event.track_temporary_local_file(str(path))
+            resp.result_chain = converted
+
+    async def convert_outgoing(
+        self, session: MessageSession, chain: MessageChain
+    ) -> tuple[MessageChain, Path | None]:
+        platform = self.context.get_platform_inst(session.platform_id)
+        if platform is None or chain.type in {
+            "tool_call",
+            "tool_call_result",
+            "agent_stats",
+            "reasoning",
+            "break",
+        }:
+            return chain, None
+        try:
+            channel = resolve_destination(session, platform.meta().name)
+            policy, _ = await self.load_channel(channel)
+        except (ValueError, ValidationError):
+            return chain, None
+        if not policy.enabled or policy.probability == 0:
+            return chain, None
+        return await self.convert_chain(chain, policy)
+
+    async def convert_chain(
+        self, chain: MessageChain, policy: ChannelSettingsSchema
+    ) -> tuple[MessageChain, Path | None]:
         if any(isinstance(component, Record) for component in chain.chain):
-            return
+            return chain, None
         text = "".join(
             component.text for component in chain.chain if isinstance(component, Plain)
         ).strip()
         if not text or len(text) > policy.max_chars:
-            return
+            return chain, None
         if secrets.randbelow(100) >= policy.probability:
-            return
+            return chain, None
         try:
             path = await self.client.synthesize(text, policy.voice, self.directory)
-            event.track_temporary_local_file(str(path))
             record = Record(file=str(path), url=str(path), text=text)
             components = []
             inserted = False
@@ -249,6 +286,7 @@ class GsviShortTtsPlugin(Star):
                         inserted = True
                 else:
                     components.append(component)
-            resp.result_chain = chain.derive(chain=components)
+            return chain.derive(chain=components), path
         except (GsviError, OSError) as error:
             self.logger.warning("GSVI TTS 失败，保留原文字：%s", error)
+            return chain, None
