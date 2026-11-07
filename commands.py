@@ -13,6 +13,7 @@ USAGE = (
     "/usetts 音色名 字数 概率，例如 /usetts 花火 80 50\n"
     "/usetts on：开启\n"
     "/usetts off：关闭\n"
+    "/usetts list：列出可用音色\n"
     "/usetts：查看状态\n"
     "字数必须为正整数，概率必须为 0–100 的整数。音色名包含空格时请加引号。"
 )
@@ -20,12 +21,12 @@ USAGE = (
 
 @dataclass(frozen=True)
 class TtsCommand:
-    action: Literal["status", "on", "off", "configure"]
+    action: Literal["status", "on", "off", "list", "configure"]
     preset: VoicePresetSchema | None = None
 
 
 def parse_command(message: str) -> TtsCommand:
-    """Accept status, one switch, or exactly three configuration arguments."""
+    """Accept status, list, one switch, or three configuration arguments."""
     try:
         parts = shlex.split(message.strip())
     except ValueError as error:
@@ -39,6 +40,8 @@ def parse_command(message: str) -> TtsCommand:
             return TtsCommand(action="on")
         if action == "off":
             return TtsCommand(action="off")
+        if action == "list":
+            return TtsCommand(action="list")
     if len(arguments) == 3:
         try:
             max_chars = int(arguments[1])

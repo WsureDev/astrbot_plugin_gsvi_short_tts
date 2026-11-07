@@ -137,9 +137,22 @@ class GsviShortTtsPlugin(Star):
         # AstrBot's call_llm flag suppresses its automatic LLM path when true.
         event.should_call_llm(True)
         try:
+            command = parse_command(event.message_str)
+            if command.action == "list":
+                models = await self.client.list_models()
+                voices = sorted(models, key=str.casefold)
+                message = "当前 GSVI 服务没有可用音色。"
+                if voices:
+                    message = (
+                        f"可用音色（{len(voices)} 个，{self.settings.version}）：\n"
+                        + "\n".join(voices)
+                        + "\n\n使用：/usetts 音色名 字数 概率"
+                    )
+                yield event.plain_result(message)
+                event.stop_event()
+                return
             channel = resolve_channel(event)
             current, initialized = await self.load_channel(channel)
-            command = parse_command(event.message_str)
             if command.action != "status":
                 if command.action == "configure":
                     if command.preset is None:
